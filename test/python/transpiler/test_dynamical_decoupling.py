@@ -30,8 +30,7 @@ from qiskit.transpiler.passes import (
 from qiskit.transpiler.passmanager import PassManager
 from qiskit.transpiler.exceptions import TranspilerError
 from qiskit.transpiler.target import Target, InstructionProperties
-
-from qiskit.test import QiskitTestCase
+from test import QiskitTestCase  # pylint: disable=wrong-import-order
 
 
 @ddt
@@ -448,7 +447,9 @@ class TestPadDynamicalDecoupling(QiskitTestCase):
             representation to satisfy PadDynamicalDecoupling's check.
             """
 
-            def __array__(self, dtype=None):
+            def __array__(self, dtype=None, copy=None):
+                if copy is False:
+                    raise ValueError("cannot produce matrix without calculation")
                 return np.eye(2, dtype=dtype)
 
         # A gate with one unbound and one bound parameter to leave in the final
@@ -586,7 +587,7 @@ class TestPadDynamicalDecoupling(QiskitTestCase):
 
         midmeas_dd = pm.run(self.midmeas)
 
-        combined_u = UGate(0, -pi / 2, pi / 2)
+        combined_u = UGate(0, 0, 0)
 
         expected = QuantumCircuit(3, 1)
         expected.cx(0, 1)
@@ -601,7 +602,7 @@ class TestPadDynamicalDecoupling(QiskitTestCase):
         expected.cx(1, 2)
         expected.cx(0, 1)
         expected.delay(700, 2)
-        expected.global_phase = pi / 2
+        expected.global_phase = pi
 
         self.assertEqual(midmeas_dd, expected)
         # check the absorption into U was done correctly
@@ -1030,6 +1031,42 @@ class TestPadDynamicalDecoupling(QiskitTestCase):
         expected.x([0])
         expected.delay(200, [0])
         self.assertEqual(expected, scheduled)
+
+    def test_paramaterized_global_phase(self):
+        """Test paramaterized global phase in DD circuit.
+        See:https://github.com/Qiskit/qiskit-terra/issues/10569
+        """
+        dd_sequence = [XGate(), YGate()] * 2
+        qc = QuantumCircuit(1, 1)
+        qc.h(0)
+        qc.delay(1700, 0)
+        qc.y(0)
+        qc.global_phase = Parameter("a")
+        pm = PassManager(
+            [
+                ALAPScheduleAnalysis(self.durations),
+                PadDynamicalDecoupling(self.durations, dd_sequence),
+            ]
+        )
+
+        self.assertEqual(qc.global_phase + np.pi, pm.run(qc).global_phase)
+
+    def test_misalignment_at_boundaries(self):
+        """Test the correct error message is raised for misalignments at In/Out nodes."""
+        # a circuit where the previous node is DAGInNode, and the next DAGOutNode
+        circuit = QuantumCircuit(1)
+        circuit.delay(101)
+
+        dd_sequence = [XGate(), XGate()]
+        pm = PassManager(
+            [
+                ALAPScheduleAnalysis(self.durations),
+                PadDynamicalDecoupling(self.durations, dd_sequence, pulse_alignment=2),
+            ]
+        )
+
+        with self.assertRaises(TranspilerError):
+            _ = pm.run(circuit)
 
 
 if __name__ == "__main__":
