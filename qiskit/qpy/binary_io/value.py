@@ -19,6 +19,11 @@ import struct
 import uuid
 
 import numpy as np
+import symengine
+from symengine.lib.symengine_wrapper import (  # pylint: disable = no-name-in-module
+    load_basic,
+)
+
 
 from qiskit.circuit import CASE_DEFAULT, Clbit, ClassicalRegister
 from qiskit.circuit.classical import expr, types
@@ -26,12 +31,11 @@ from qiskit.circuit.parameter import Parameter
 from qiskit.circuit.parameterexpression import ParameterExpression
 from qiskit.circuit.parametervector import ParameterVector, ParameterVectorElement
 from qiskit.qpy import common, formats, exceptions, type_keys
-from qiskit.utils import optionals as _optional
 
 
 def _write_parameter(file_obj, obj):
-    name_bytes = obj._name.encode(common.ENCODE)
-    file_obj.write(struct.pack(formats.PARAMETER_PACK, len(name_bytes), obj._uuid.bytes))
+    name_bytes = obj.name.encode(common.ENCODE)
+    file_obj.write(struct.pack(formats.PARAMETER_PACK, len(name_bytes), obj.uuid.bytes))
     file_obj.write(name_bytes)
 
 
@@ -41,17 +45,16 @@ def _write_parameter_vec(file_obj, obj):
         struct.pack(
             formats.PARAMETER_VECTOR_ELEMENT_PACK,
             len(name_bytes),
-            obj._vector._size,
-            obj._uuid.bytes,
+            len(obj._vector),
+            obj.uuid.bytes,
             obj._index,
         )
     )
     file_obj.write(name_bytes)
 
 
-def _write_parameter_expression(file_obj, obj, use_symengine):
+def _write_parameter_expression(file_obj, obj, use_symengine, *, version):
     if use_symengine:
-        _optional.HAS_SYMENGINE.require_now("write_parameter_expression")
         expr_bytes = obj._symbol_expr.__reduce__()[1][0]
     else:
         from sympy import srepr, sympify
@@ -78,7 +81,7 @@ def _write_parameter_expression(file_obj, obj, use_symengine):
             value_key = symbol_key
             value_data = bytes()
         else:
-            value_key, value_data = dumps_value(value, use_symengine=use_symengine)
+            value_key, value_data = dumps_value(value, version=version, use_symengine=use_symengine)
 
         elem_header = struct.pack(
             formats.PARAM_EXPR_MAP_ELEM_V3_PACK,
@@ -92,11 +95,13 @@ def _write_parameter_expression(file_obj, obj, use_symengine):
 
 
 class _ExprWriter(expr.ExprVisitor[None]):
-    __slots__ = ("file_obj", "clbit_indices")
+    __slots__ = ("file_obj", "clbit_indices", "standalone_var_indices", "version")
 
-    def __init__(self, file_obj, clbit_indices):
+    def __init__(self, file_obj, clbit_indices, standalone_var_indices, version):
         self.file_obj = file_obj
         self.clbit_indices = clbit_indices
+        self.standalone_var_indices = standalone_var_indices
+        self.version = version
 
     def visit_generic(self, node, /):
         raise exceptions.QpyError(f"unhandled Expr object '{node}'")
@@ -104,7 +109,15 @@ class _ExprWriter(expr.ExprVisitor[None]):
     def visit_var(self, node, /):
         self.file_obj.write(type_keys.Expression.VAR)
         _write_expr_type(self.file_obj, node.type)
-        if isinstance(node.var, Clbit):
+        if node.standalone:
+            self.file_obj.write(type_keys.ExprVar.UUID)
+            self.file_obj.write(
+                struct.pack(
+                    formats.EXPR_VAR_UUID_PACK,
+                    *formats.EXPR_VAR_UUID(self.standalone_var_indices[node]),
+                )
+            )
+        elif isinstance(node.var, Clbit):
             self.file_obj.write(type_keys.ExprVar.CLBIT)
             self.file_obj.write(
                 struct.pack(
@@ -169,14 +182,30 @@ class _ExprWriter(expr.ExprVisitor[None]):
         self.file_obj.write(type_keys.Expression.BINARY)
         _write_expr_type(self.file_obj, node.type)
         self.file_obj.write(
-            struct.pack(formats.EXPRESSION_BINARY_PACK, *formats.EXPRESSION_UNARY(node.op.value))
+            struct.pack(formats.EXPRESSION_BINARY_PACK, *formats.EXPRESSION_BINARY(node.op.value))
         )
         node.left.accept(self)
         node.right.accept(self)
 
+    def visit_index(self, node, /):
+        if self.version < 12:
+            raise exceptions.UnsupportedFeatureForVersion(
+                "the 'Index' expression", required=12, target=self.version
+            )
+        self.file_obj.write(type_keys.Expression.INDEX)
+        _write_expr_type(self.file_obj, node.type)
+        node.target.accept(self)
+        node.index.accept(self)
 
-def _write_expr(file_obj, node: expr.Expr, clbit_indices: collections.abc.Mapping[Clbit, int]):
-    node.accept(_ExprWriter(file_obj, clbit_indices))
+
+def _write_expr(
+    file_obj,
+    node: expr.Expr,
+    clbit_indices: collections.abc.Mapping[Clbit, int],
+    standalone_var_indices: collections.abc.Mapping[expr.Var, int],
+    version: int,
+):
+    node.accept(_ExprWriter(file_obj, clbit_indices, standalone_var_indices, version))
 
 
 def _write_expr_type(file_obj, type_: types.Type):
@@ -197,9 +226,7 @@ def _read_parameter(file_obj):
     )
     param_uuid = uuid.UUID(bytes=data.uuid)
     name = file_obj.read(data.name_size).decode(common.ENCODE)
-    param = Parameter.__new__(Parameter, name, uuid=param_uuid)
-    param.__init__(name)
-    return param
+    return Parameter(name, uuid=param_uuid)
 
 
 def _read_parameter_vec(file_obj, vectors):
@@ -214,12 +241,9 @@ def _read_parameter_vec(file_obj, vectors):
     if name not in vectors:
         vectors[name] = (ParameterVector(name, data.vector_size), set())
     vector = vectors[name][0]
-    if vector[data.index]._uuid != param_uuid:
+    if vector[data.index].uuid != param_uuid:
         vectors[name][1].add(data.index)
-        vector._params[data.index] = ParameterVectorElement.__new__(
-            ParameterVectorElement, vector, data.index, uuid=param_uuid
-        )
-        vector._params[data.index].__init__(vector, data.index)
+        vector._params[data.index] = ParameterVectorElement(vector, data.index, uuid=param_uuid)
     return vector[data.index]
 
 
@@ -229,13 +253,7 @@ def _read_parameter_expression(file_obj):
     )
     from sympy.parsing.sympy_parser import parse_expr
 
-    if _optional.HAS_SYMENGINE:
-        from symengine import sympify
-
-        expr_ = sympify(parse_expr(file_obj.read(data.expr_size).decode(common.ENCODE)))
-    else:
-        expr_ = parse_expr(file_obj.read(data.expr_size).decode(common.ENCODE))
-
+    expr_ = symengine.sympify(parse_expr(file_obj.read(data.expr_size).decode(common.ENCODE)))
     symbol_map = {}
     for _ in range(data.map_elements):
         elem_data = formats.PARAM_EXPR_MAP_ELEM(
@@ -259,7 +277,7 @@ def _read_parameter_expression(file_obj):
         elif elem_key == type_keys.Value.PARAMETER_EXPRESSION:
             value = common.data_from_binary(binary_data, _read_parameter_expression)
         else:
-            raise exceptions.QpyError("Invalid parameter expression map type: %s" % elem_key)
+            raise exceptions.QpyError(f"Invalid parameter expression map type: {elem_key}")
         symbol_map[symbol] = value
 
     return ParameterExpression(symbol_map, expr_)
@@ -269,23 +287,14 @@ def _read_parameter_expression_v3(file_obj, vectors, use_symengine):
     data = formats.PARAMETER_EXPR(
         *struct.unpack(formats.PARAMETER_EXPR_PACK, file_obj.read(formats.PARAMETER_EXPR_SIZE))
     )
-    from sympy.parsing.sympy_parser import parse_expr
 
     payload = file_obj.read(data.expr_size)
     if use_symengine:
-        _optional.HAS_SYMENGINE.require_now("read_parameter_expression_v3")
-        from symengine.lib.symengine_wrapper import (  # pylint: disable = no-name-in-module
-            load_basic,
-        )
-
         expr_ = load_basic(payload)
     else:
-        if _optional.HAS_SYMENGINE:
-            from symengine import sympify
+        from sympy.parsing.sympy_parser import parse_expr
 
-            expr_ = sympify(parse_expr(payload.decode(common.ENCODE)))
-        else:
-            expr_ = parse_expr(payload.decode(common.ENCODE))
+        expr_ = symengine.sympify(parse_expr(payload.decode(common.ENCODE)))
 
     symbol_map = {}
     for _ in range(data.map_elements):
@@ -302,7 +311,7 @@ def _read_parameter_expression_v3(file_obj, vectors, use_symengine):
         elif symbol_key == type_keys.Value.PARAMETER_VECTOR:
             symbol = _read_parameter_vec(file_obj, vectors)
         else:
-            raise exceptions.QpyError("Invalid parameter expression map type: %s" % symbol_key)
+            raise exceptions.QpyError(f"Invalid parameter expression map type: {symbol_key}")
 
         elem_key = type_keys.Value(elem_data.type)
         binary_data = file_obj.read(elem_data.size)
@@ -322,7 +331,7 @@ def _read_parameter_expression_v3(file_obj, vectors, use_symengine):
                 use_symengine=use_symengine,
             )
         else:
-            raise exceptions.QpyError("Invalid parameter expression map type: %s" % elem_key)
+            raise exceptions.QpyError(f"Invalid parameter expression map type: {elem_key}")
         symbol_map[symbol] = value
 
     return ParameterExpression(symbol_map, expr_)
@@ -332,12 +341,18 @@ def _read_expr(
     file_obj,
     clbits: collections.abc.Sequence[Clbit],
     cregs: collections.abc.Mapping[str, ClassicalRegister],
+    standalone_vars: collections.abc.Sequence[expr.Var],
 ) -> expr.Expr:
     # pylint: disable=too-many-return-statements
     type_key = file_obj.read(formats.EXPRESSION_DISCRIMINATOR_SIZE)
     type_ = _read_expr_type(file_obj)
     if type_key == type_keys.Expression.VAR:
         var_type_key = file_obj.read(formats.EXPR_VAR_DISCRIMINATOR_SIZE)
+        if var_type_key == type_keys.ExprVar.UUID:
+            payload = formats.EXPR_VAR_UUID._make(
+                struct.unpack(formats.EXPR_VAR_UUID_PACK, file_obj.read(formats.EXPR_VAR_UUID_SIZE))
+            )
+            return standalone_vars[payload.var_index]
         if var_type_key == type_keys.ExprVar.CLBIT:
             payload = formats.EXPR_VAR_CLBIT._make(
                 struct.unpack(
@@ -377,14 +392,20 @@ def _read_expr(
         payload = formats.EXPRESSION_CAST._make(
             struct.unpack(formats.EXPRESSION_CAST_PACK, file_obj.read(formats.EXPRESSION_CAST_SIZE))
         )
-        return expr.Cast(_read_expr(file_obj, clbits, cregs), type_, implicit=payload.implicit)
+        return expr.Cast(
+            _read_expr(file_obj, clbits, cregs, standalone_vars), type_, implicit=payload.implicit
+        )
     if type_key == type_keys.Expression.UNARY:
         payload = formats.EXPRESSION_UNARY._make(
             struct.unpack(
                 formats.EXPRESSION_UNARY_PACK, file_obj.read(formats.EXPRESSION_UNARY_SIZE)
             )
         )
-        return expr.Unary(expr.Unary.Op(payload.opcode), _read_expr(file_obj, clbits, cregs), type_)
+        return expr.Unary(
+            expr.Unary.Op(payload.opcode),
+            _read_expr(file_obj, clbits, cregs, standalone_vars),
+            type_,
+        )
     if type_key == type_keys.Expression.BINARY:
         payload = formats.EXPRESSION_BINARY._make(
             struct.unpack(
@@ -393,11 +414,17 @@ def _read_expr(
         )
         return expr.Binary(
             expr.Binary.Op(payload.opcode),
-            _read_expr(file_obj, clbits, cregs),
-            _read_expr(file_obj, clbits, cregs),
+            _read_expr(file_obj, clbits, cregs, standalone_vars),
+            _read_expr(file_obj, clbits, cregs, standalone_vars),
             type_,
         )
-    raise exceptions.QpyError("Invalid classical-expression Expr key '{type_key}'")
+    if type_key == type_keys.Expression.INDEX:
+        return expr.Index(
+            _read_expr(file_obj, clbits, cregs, standalone_vars),
+            _read_expr(file_obj, clbits, cregs, standalone_vars),
+            type_,
+        )
+    raise exceptions.QpyError(f"Invalid classical-expression Expr key '{type_key}'")
 
 
 def _read_expr_type(file_obj) -> types.Type:
@@ -412,11 +439,92 @@ def _read_expr_type(file_obj) -> types.Type:
     raise exceptions.QpyError(f"Invalid classical-expression Type key '{type_key}'")
 
 
-def dumps_value(obj, *, index_map=None, use_symengine=False):
+def read_standalone_vars(file_obj, num_vars):
+    """Read the ``num_vars`` standalone variable declarations from the file.
+
+    Args:
+        file_obj (File): a file-like object to read from.
+        num_vars (int): the number of variables to read.
+
+    Returns:
+        tuple[dict, list]: the first item is a mapping of the ``ExprVarDeclaration`` type keys to
+        the variables defined by that type key, and the second is the total order of variable
+        declarations.
+    """
+    read_vars = {
+        type_keys.ExprVarDeclaration.INPUT: [],
+        type_keys.ExprVarDeclaration.CAPTURE: [],
+        type_keys.ExprVarDeclaration.LOCAL: [],
+    }
+    var_order = []
+    for _ in range(num_vars):
+        data = formats.EXPR_VAR_DECLARATION._make(
+            struct.unpack(
+                formats.EXPR_VAR_DECLARATION_PACK,
+                file_obj.read(formats.EXPR_VAR_DECLARATION_SIZE),
+            )
+        )
+        type_ = _read_expr_type(file_obj)
+        name = file_obj.read(data.name_size).decode(common.ENCODE)
+        var = expr.Var(uuid.UUID(bytes=data.uuid_bytes), type_, name=name)
+        read_vars[data.usage].append(var)
+        var_order.append(var)
+    return read_vars, var_order
+
+
+def _write_standalone_var(file_obj, var, type_key):
+    name = var.name.encode(common.ENCODE)
+    file_obj.write(
+        struct.pack(
+            formats.EXPR_VAR_DECLARATION_PACK,
+            *formats.EXPR_VAR_DECLARATION(var.var.bytes, type_key, len(name)),
+        )
+    )
+    _write_expr_type(file_obj, var.type)
+    file_obj.write(name)
+
+
+def write_standalone_vars(file_obj, circuit):
+    """Write the standalone variables out from a circuit.
+
+    Args:
+        file_obj (File): the file-like object to write to.
+        circuit (QuantumCircuit): the circuit to take the variables from.
+
+    Returns:
+        dict[expr.Var, int]: a mapping of the variables written to the index that they were written
+        at.
+    """
+    index = 0
+    out = {}
+    for var in circuit.iter_input_vars():
+        _write_standalone_var(file_obj, var, type_keys.ExprVarDeclaration.INPUT)
+        out[var] = index
+        index += 1
+    for var in circuit.iter_captured_vars():
+        _write_standalone_var(file_obj, var, type_keys.ExprVarDeclaration.CAPTURE)
+        out[var] = index
+        index += 1
+    for var in circuit.iter_declared_vars():
+        _write_standalone_var(file_obj, var, type_keys.ExprVarDeclaration.LOCAL)
+        out[var] = index
+        index += 1
+    return out
+
+
+def dumps_value(
+    obj,
+    *,
+    version,
+    index_map=None,
+    use_symengine=False,
+    standalone_var_indices=None,
+):
     """Serialize input value object.
 
     Args:
         obj (any): Arbitrary value object to serialize.
+        version (int): the target QPY version for the dump.
         index_map (dict): Dictionary with two keys, "q" and "c".  Each key has a value that is a
             dictionary mapping :class:`.Qubit` or :class:`.Clbit` instances (respectively) to their
             integer indices.
@@ -424,6 +532,8 @@ def dumps_value(obj, *, index_map=None, use_symengine=False):
             native mechanism. This is a faster serialization alternative, but not supported in all
             platforms. Please check that your target platform is supported by the symengine library
             before setting this option, as it will be required by qpy to deserialize the payload.
+        standalone_var_indices (dict): Dictionary that maps standalone :class:`.expr.Var` entries to
+            the index that should be used to refer to them.
 
     Returns:
         tuple: TypeKey and binary data.
@@ -451,23 +561,33 @@ def dumps_value(obj, *, index_map=None, use_symengine=False):
         binary_data = common.data_to_binary(obj, _write_parameter)
     elif type_key == type_keys.Value.PARAMETER_EXPRESSION:
         binary_data = common.data_to_binary(
-            obj, _write_parameter_expression, use_symengine=use_symengine
+            obj, _write_parameter_expression, use_symengine=use_symengine, version=version
         )
     elif type_key == type_keys.Value.EXPRESSION:
         clbit_indices = {} if index_map is None else index_map["c"]
-        binary_data = common.data_to_binary(obj, _write_expr, clbit_indices=clbit_indices)
+        standalone_var_indices = {} if standalone_var_indices is None else standalone_var_indices
+        binary_data = common.data_to_binary(
+            obj,
+            _write_expr,
+            clbit_indices=clbit_indices,
+            standalone_var_indices=standalone_var_indices,
+            version=version,
+        )
     else:
         raise exceptions.QpyError(f"Serialization for {type_key} is not implemented in value I/O.")
 
     return type_key, binary_data
 
 
-def write_value(file_obj, obj, *, index_map=None, use_symengine=False):
+def write_value(
+    file_obj, obj, *, version, index_map=None, use_symengine=False, standalone_var_indices=None
+):
     """Write a value to the file like object.
 
     Args:
         file_obj (File): A file like object to write data.
         obj (any): Value to write.
+        version (int): the target QPY version for the dump.
         index_map (dict): Dictionary with two keys, "q" and "c".  Each key has a value that is a
             dictionary mapping :class:`.Qubit` or :class:`.Clbit` instances (respectively) to their
             integer indices.
@@ -475,13 +595,29 @@ def write_value(file_obj, obj, *, index_map=None, use_symengine=False):
             native mechanism. This is a faster serialization alternative, but not supported in all
             platforms. Please check that your target platform is supported by the symengine library
             before setting this option, as it will be required by qpy to deserialize the payload.
+        standalone_var_indices (dict): Dictionary that maps standalone :class:`.expr.Var` entries to
+            the index that should be used to refer to them.
     """
-    type_key, data = dumps_value(obj, index_map=index_map, use_symengine=use_symengine)
+    type_key, data = dumps_value(
+        obj,
+        version=version,
+        index_map=index_map,
+        use_symengine=use_symengine,
+        standalone_var_indices=standalone_var_indices,
+    )
     common.write_generic_typed_data(file_obj, type_key, data)
 
 
 def loads_value(
-    type_key, binary_data, version, vectors, *, clbits=(), cregs=None, use_symengine=False
+    type_key,
+    binary_data,
+    version,
+    vectors,
+    *,
+    clbits=(),
+    cregs=None,
+    use_symengine=False,
+    standalone_vars=(),
 ):
     """Deserialize input binary data to value object.
 
@@ -496,6 +632,8 @@ def loads_value(
             native mechanism. This is a faster serialization alternative, but not supported in all
             platforms. Please check that your target platform is supported by the symengine library
             before setting this option, as it will be required by qpy to deserialize the payload.
+        standalone_vars (Sequence[Var]): standalone :class:`.expr.Var` nodes in the order that they
+            were declared by the circuit header.
 
     Returns:
         any: Deserialized value object.
@@ -537,12 +675,27 @@ def loads_value(
                 use_symengine=use_symengine,
             )
     if type_key == type_keys.Value.EXPRESSION:
-        return common.data_from_binary(binary_data, _read_expr, clbits=clbits, cregs=cregs or {})
+        return common.data_from_binary(
+            binary_data,
+            _read_expr,
+            clbits=clbits,
+            cregs=cregs or {},
+            standalone_vars=standalone_vars,
+        )
 
     raise exceptions.QpyError(f"Serialization for {type_key} is not implemented in value I/O.")
 
 
-def read_value(file_obj, version, vectors, *, clbits=(), cregs=None, use_symengine=False):
+def read_value(
+    file_obj,
+    version,
+    vectors,
+    *,
+    clbits=(),
+    cregs=None,
+    use_symengine=False,
+    standalone_vars=(),
+):
     """Read a value from the file like object.
 
     Args:
@@ -555,6 +708,8 @@ def read_value(file_obj, version, vectors, *, clbits=(), cregs=None, use_symengi
             native mechanism. This is a faster serialization alternative, but not supported in all
             platforms. Please check that your target platform is supported by the symengine library
             before setting this option, as it will be required by qpy to deserialize the payload.
+        standalone_vars (Sequence[expr.Var]): standalone variables in the order they were defined in
+            the QPY payload.
 
     Returns:
         any: Deserialized value object.
@@ -562,5 +717,12 @@ def read_value(file_obj, version, vectors, *, clbits=(), cregs=None, use_symengi
     type_key, data = common.read_generic_typed_data(file_obj)
 
     return loads_value(
-        type_key, data, version, vectors, clbits=clbits, cregs=cregs, use_symengine=use_symengine
+        type_key,
+        data,
+        version,
+        vectors,
+        clbits=clbits,
+        cregs=cregs,
+        use_symengine=use_symengine,
+        standalone_vars=standalone_vars,
     )

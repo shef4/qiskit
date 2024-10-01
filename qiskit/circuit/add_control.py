@@ -15,6 +15,10 @@ from __future__ import annotations
 
 from qiskit.circuit.exceptions import CircuitError
 from qiskit.circuit.library import UnitaryGate
+from qiskit.transpiler import PassManager
+from qiskit.transpiler.passes.basis import BasisTranslator, UnrollCustomDefinitions
+from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary as sel
+
 from . import ControlledGate, Gate, QuantumRegister, QuantumCircuit
 from ._utils import _ctrl_state_to_int
 
@@ -69,7 +73,7 @@ def control(
 ) -> ControlledGate:
     """Return controlled version of gate using controlled rotations. This function
     first checks the name of the operation to see if it knows of a method from which
-    to generate a controlled version. Currently these are `x`, `rx`, `ry`, and `rz`.
+    to generate a controlled version. Currently, these are ``x``, ``rx``, ``ry``, and ``rz``.
     If a method is not directly known, it calls the unroller to convert to `u1`, `u3`,
     and `cx` gates.
 
@@ -111,6 +115,7 @@ def control(
     else:
         basis = ["p", "u", "x", "z", "rx", "ry", "rz", "cx"]
         if isinstance(operation, controlledgate.ControlledGate):
+            operation = operation.to_mutable()
             operation.ctrl_state = None
         unrolled_gate = _unroll_gate(operation, basis_gates=basis)
         if unrolled_gate.definition.global_phase:
@@ -132,7 +137,7 @@ def control(
                     gate.definition.data[0].operation.params[0],
                     q_control,
                     q_target[bit_indices[qargs[0]]],
-                    use_basis_gates=True,
+                    use_basis_gates=False,
                 )
             elif gate.name == "ry":
                 controlled_circ.mcry(
@@ -141,14 +146,14 @@ def control(
                     q_target[bit_indices[qargs[0]]],
                     q_ancillae,
                     mode="noancilla",
-                    use_basis_gates=True,
+                    use_basis_gates=False,
                 )
             elif gate.name == "rz":
                 controlled_circ.mcrz(
                     gate.definition.data[0].operation.params[0],
                     q_control,
                     q_target[bit_indices[qargs[0]]],
-                    use_basis_gates=True,
+                    use_basis_gates=False,
                 )
                 continue
             elif gate.name == "p":
@@ -245,23 +250,25 @@ def control(
     return cgate
 
 
-def _gate_to_dag(operation):
-    from qiskit.converters.circuit_to_dag import circuit_to_dag
-
+def _gate_to_circuit(operation):
+    """Converts a gate instance to a QuantumCircuit"""
     if hasattr(operation, "definition") and operation.definition is not None:
-        return circuit_to_dag(operation.definition)
+        return operation.definition
     else:
         qr = QuantumRegister(operation.num_qubits)
         qc = QuantumCircuit(qr, name=operation.name)
         qc.append(operation, qr)
-        return circuit_to_dag(qc)
+        return qc
 
 
 def _unroll_gate(operation, basis_gates):
-    from qiskit.converters.dag_to_circuit import dag_to_circuit
-    from qiskit.transpiler.passes import Unroller
-
-    unroller = Unroller(basis_gates)
-    dag = _gate_to_dag(operation)
-    opqc = dag_to_circuit(unroller.run(dag))
+    """Unrolls a gate, possibly composite, to the target basis"""
+    circ = _gate_to_circuit(operation)
+    pm = PassManager(
+        [
+            UnrollCustomDefinitions(sel, basis_gates=basis_gates),
+            BasisTranslator(sel, target_basis=basis_gates),
+        ]
+    )
+    opqc = pm.run(circ)
     return opqc.to_gate()

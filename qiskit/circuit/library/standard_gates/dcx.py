@@ -12,9 +12,10 @@
 
 """Double-CNOT gate."""
 
-from qiskit.circuit.singleton_gate import SingletonGate
+from qiskit.circuit.singleton import SingletonGate, stdlib_singleton_key
 from qiskit.circuit.quantumregister import QuantumRegister
 from qiskit.circuit._utils import with_gate_array
+from qiskit._accelerate.circuit import StandardGate
 
 
 @with_gate_array([[1, 0, 0, 0], [0, 0, 0, 1], [0, 1, 0, 0], [0, 0, 1, 0]])
@@ -48,14 +49,13 @@ class DCXGate(SingletonGate):
             \end{pmatrix}
     """
 
-    def __init__(self, label=None, duration=None, unit=None, _condition=None):
-        """Create new DCX gate."""
-        if unit is None:
-            unit = "dt"
+    _standard_gate = StandardGate.DCXGate
 
-        super().__init__(
-            "dcx", 2, [], label=label, _condition=_condition, duration=duration, unit=unit
-        )
+    def __init__(self, label=None, *, duration=None, unit="dt"):
+        """Create new DCX gate."""
+        super().__init__("dcx", 2, [], label=label, duration=duration, unit=unit)
+
+    _singleton_lookup_key = stdlib_singleton_key()
 
     def _define(self):
         """
@@ -72,3 +72,6 @@ class DCXGate(SingletonGate):
             qc._append(instr, qargs, cargs)
 
         self.definition = qc
+
+    def __eq__(self, other):
+        return isinstance(other, DCXGate)
